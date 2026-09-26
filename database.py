@@ -13,6 +13,7 @@ class DomainError(ValueError):
 
 WITNESS_KINDS = {"version", "fragment", "transcription"}
 SPECIAL_TOKENS = {"[缺页]", "[不可辨]", "[残损]", "[插入]", "[删除]"}
+RULING_GAP_TOKENS = ("[缺页]", "[残损]")
 
 
 def validate_transcription(text: str) -> str:
@@ -144,6 +145,20 @@ class CollationDB:
               reason TEXT NOT NULL DEFAULT '',
               locked_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS rulings (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              passage_id INTEGER NOT NULL REFERENCES passages(id) ON DELETE CASCADE,
+              variant_id INTEGER NOT NULL REFERENCES variants(id),
+              adopted_text TEXT NOT NULL,
+              rationale TEXT NOT NULL,
+              status TEXT NOT NULL CHECK(status IN ('pending','confirmed','superseded')),
+              reviewer_id INTEGER NOT NULL REFERENCES users(id),
+              confirmed_by INTEGER REFERENCES users(id),
+              change_reason TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              confirmed_at TEXT,
+              superseded_at TEXT
+            );
             """
         )
         self.conn.commit()
@@ -153,15 +168,18 @@ class CollationDB:
             return
         owner = self.add_user("项目负责人", "owner")
         editor = self.add_user("校勘编辑", "editor")
+        reviewer = self.add_user("审阅人", "reviewer")
         work = self.create_work("一则残卷", "演示不同版本的校勘", owner)
         w1 = self.add_witness(work, "甲本", "version", "馆藏胶片", "")
         w2 = self.add_witness(work, "乙本", "fragment", "残片转录", "第二句残损")
         self.grant_witness_editor(w2, editor, owner)
+        self.grant_work_access(work, reviewer, "review", owner)
         passage = self.add_passage(work, "第1节", "春水东流，故人南去。", owner)
         self.align_passage(passage, w1, "春水东流，故人南去。", 1, owner)
         self.align_passage(passage, w2, "春水东流，[不可辨][不可辨]。", 2, owner)
         variant = self.create_variant(passage, w2, "春水东流，故人南去。", "综合语义与行款补足", owner, 0)
         self.add_note(variant, "补字仍需参照纸背墨迹。", editor)
+        self.create_ruling(passage, variant, "甲乙两本互补，采用补足文本", reviewer)
 
     def add_user(self, name: str, role: str) -> int:
         if not name.strip() or role not in {"owner", "editor", "reviewer"}:
@@ -367,6 +385,77 @@ class CollationDB:
             )
         return int(cur.lastrowid)
 
+    def _can_rule(self, work_id: int, user_id: int) -> bool:
+        if self.conn.execute("SELECT 1 FROM works WHERE id=? AND owner_id=?", (work_id, user_id)).fetchone():
+            return True
+        row = self.conn.execute("SELECT permission FROM work_access WHERE work_id=? AND user_id=?", (work_id, user_id)).fetchone()
+        return bool(row and row["permission"] == "review")
+
+    def create_ruling(self, passage_id: int, variant_id: int, rationale: str, user_id: int,
+                      change_reason: str = "") -> tuple[int, str]:
+        with self.transaction():
+            passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
+            if not passage:
+                raise DomainError("段落不存在")
+            variant = self.conn.execute("SELECT * FROM variants WHERE id=?", (variant_id,)).fetchone()
+            if not variant or variant["passage_id"] != passage_id:
+                raise DomainError("所选异文不属于该段落")
+            if not self._can_rule(passage["work_id"], user_id):
+                raise DomainError("只有审阅人或负责人可以提交裁定")
+            rationale = rationale.strip()
+            if len(rationale) < 3:
+                raise DomainError("取舍说明至少3个字符")
+            change_reason = change_reason.strip()
+            current = self.conn.execute(
+                "SELECT * FROM rulings WHERE passage_id=? AND status IN ('pending','confirmed') ORDER BY id DESC LIMIT 1",
+                (passage_id,),
+            ).fetchone()
+            if current and current["status"] == "confirmed" and not change_reason:
+                raise DomainError("定稿后改判必须填写变更原因")
+            adopted = variant["proposed_text"]
+            status = "pending" if any(token in adopted for token in RULING_GAP_TOKENS) else "confirmed"
+            now = datetime.now().isoformat()
+            if current:
+                self.conn.execute(
+                    "UPDATE rulings SET status='superseded',change_reason=?,superseded_at=? WHERE id=?",
+                    (change_reason, now, current["id"]),
+                )
+            cur = self.conn.execute(
+                "INSERT INTO rulings(passage_id,variant_id,adopted_text,rationale,status,reviewer_id,created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (passage_id, variant_id, adopted, rationale, status, user_id, now),
+            )
+            return int(cur.lastrowid), status
+
+    def confirm_ruling(self, ruling_id: int, user_id: int) -> None:
+        with self.transaction():
+            ruling = self.conn.execute("SELECT * FROM rulings WHERE id=?", (ruling_id,)).fetchone()
+            if not ruling:
+                raise DomainError("裁定不存在")
+            work_id = self.conn.execute("SELECT work_id FROM passages WHERE id=?", (ruling["passage_id"],)).fetchone()["work_id"]
+            self._require_owner(work_id, user_id)
+            if ruling["status"] != "pending":
+                raise DomainError("只有待确认的裁定可以确认")
+            self.conn.execute(
+                "UPDATE rulings SET status='confirmed',confirmed_by=?,confirmed_at=? WHERE id=?",
+                (user_id, datetime.now().isoformat(), ruling_id),
+            )
+
+    def list_rulings(self, passage_id: int, user_id: int) -> dict:
+        passage = self.conn.execute("SELECT work_id FROM passages WHERE id=?", (passage_id,)).fetchone()
+        if not passage or not self.can_view_work(passage["work_id"], user_id):
+            raise DomainError("无权查看该段落裁定")
+        rulings = [self._ruling_dict(r) for r in self.conn.execute(
+            "SELECT * FROM rulings WHERE passage_id=? ORDER BY id DESC", (passage_id,)).fetchall()]
+        return {"passage_id": passage_id, "rulings": rulings}
+
+    def _ruling_dict(self, row) -> dict:
+        item = dict(row)
+        item["reviewer_name"] = self.conn.execute("SELECT name FROM users WHERE id=?", (row["reviewer_id"],)).fetchone()["name"]
+        confirmer = self.conn.execute("SELECT name FROM users WHERE id=?", (row["confirmed_by"],)).fetchone() if row["confirmed_by"] else None
+        item["confirmer_name"] = confirmer["name"] if confirmer else None
+        return item
+
     def lock_passage(self, passage_id: int, user_id: int, reason: str = "") -> None:
         passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
         if not passage:
@@ -395,6 +484,8 @@ class CollationDB:
         witnesses = [dict(r) for r in self.conn.execute("SELECT * FROM witnesses WHERE work_id=? ORDER BY id", (work_id,))]
         passages = []
         gaps = 0
+        pending_rulings = 0
+        history_rulings = 0
         for passage in self.conn.execute("SELECT * FROM passages WHERE work_id=? ORDER BY id", (work_id,)).fetchall():
             alignments = []
             for row in self.conn.execute(
@@ -411,8 +502,17 @@ class CollationDB:
                 variant = dict(row)
                 variant["notes"] = [dict(r) for r in self.conn.execute("SELECT * FROM notes WHERE variant_id=? ORDER BY id", (row["id"],))]
                 variants.append(variant)
-            passages.append({**dict(passage), "alignments": alignments, "variants": variants})
-        return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps}
+            rulings = [self._ruling_dict(r) for r in self.conn.execute(
+                "SELECT * FROM rulings WHERE passage_id=? ORDER BY id DESC", (passage["id"],)).fetchall()]
+            ruling = next((r for r in rulings if r["status"] in ("pending", "confirmed")), None)
+            ruling_history = [r for r in rulings if r["status"] == "superseded"]
+            if ruling and ruling["status"] == "pending":
+                pending_rulings += 1
+            history_rulings += len(ruling_history)
+            passages.append({**dict(passage), "alignments": alignments, "variants": variants,
+                             "ruling": ruling, "ruling_history": ruling_history})
+        return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps,
+                "pending_ruling_count": pending_rulings, "history_ruling_count": history_rulings}
 
     def snapshot(self) -> dict:
         return {
