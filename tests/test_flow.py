@@ -36,5 +36,41 @@ class CollationFlowTest(unittest.TestCase):
             self.db.export_collation(self.work,self.outsider)
         with self.assertRaisesRegex(DomainError,"括号"):
             self.db.align_passage(self.passage,self.w1,"文本[未闭合",9,self.owner)
+    def test_ruling_pending_confirm_and_overrule(self):
+        variant=self.db.create_variant(self.passage,self.w2,"春水东流，[缺页]","残片缺页，存疑待补",self.editor,0)
+        with self.assertRaisesRegex(DomainError,"审阅权限"):
+            self.db.create_ruling(self.passage,variant,"审阅人仅有查看权限",self.reviewer)
+        self.db.grant_work_access(self.work,self.reviewer,"review",self.owner)
+        with self.assertRaisesRegex(DomainError,"不属于该段落"):
+            self.db.create_ruling(self.passage,999,"异文不存在",self.reviewer)
+        ruling=self.db.create_ruling(self.passage,variant,"缺页处不宜臆补，暂存原貌",self.reviewer)
+        exported=self.db.export_collation(self.work,self.owner)
+        self.assertEqual(1,exported["pending_ruling_count"])
+        self.assertEqual("春水东流，[缺页]",exported["passages"][0]["adopted_text"])
+        self.assertEqual("pending",exported["passages"][0]["ruling"]["status"])
+        with self.assertRaisesRegex(DomainError,"负责人"):
+            self.db.confirm_ruling(ruling,self.reviewer)
+        with self.assertRaisesRegex(DomainError,"待确认"):
+            self.db.create_ruling(self.passage,variant,"换个说法再裁定",self.reviewer)
+        self.db.confirm_ruling(ruling,self.owner)
+        with self.assertRaisesRegex(DomainError,"变更原因"):
+            self.db.create_ruling(self.passage,variant,"改判却不写原因",self.reviewer)
+        second=self.db.create_ruling(self.passage,variant,"据新出残片改定文本",self.reviewer,change_reason="新残片证实缺字可补")
+        exported=self.db.export_collation(self.work,self.owner)
+        self.assertEqual(1,exported["pending_ruling_count"])
+        self.assertEqual(2,exported["ruling_history_count"])
+        self.assertEqual(second,exported["passages"][0]["ruling"]["id"])
+        self.db.confirm_ruling(second,self.owner)
+        exported=self.db.export_collation(self.work,self.owner)
+        self.assertEqual(0,exported["pending_ruling_count"])
+        self.assertEqual("confirmed",exported["passages"][0]["ruling"]["status"])
+    def test_ruling_without_gap_markers_is_final_immediately(self):
+        variant=self.db.create_variant(self.passage,self.w2,"春水东流，故人南去。","按甲本补足",self.editor,0)
+        self.db.grant_work_access(self.work,self.reviewer,"review",self.owner)
+        self.db.create_ruling(self.passage,variant,"甲本文意完整可据",self.reviewer)
+        exported=self.db.export_collation(self.work,self.owner)
+        self.assertEqual(0,exported["pending_ruling_count"])
+        self.assertEqual("confirmed",exported["passages"][0]["ruling"]["status"])
+        self.assertEqual(1,exported["ruling_history_count"])
 
 if __name__=="__main__": unittest.main()

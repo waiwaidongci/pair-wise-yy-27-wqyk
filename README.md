@@ -19,6 +19,9 @@ python -m unittest discover -s tests -v
 - `[缺页]`、`[不可辨]`、`[残损]` 等标记会参与校勘稿导出和缺口统计，不匹配的方括号会拒绝保存。
 - 每次新增或修改异文都会产生递增修订号和 JSON 快照；提交必须携带 `expected_revision`，旧页面不能覆盖新层。
 - 锁定段落由负责人执行，锁定后任何新修订都会被拒绝。
+- 审阅人（`review` 权限）可从已对齐的异文层中选一条提交裁定单，必须填写取舍说明；采用文本含 `[缺页]` 或 `[残损]` 时裁定为待确认，负责人确认后才成为定稿，无标记则直接定稿。
+- 已定稿的段落再次裁定视为改判：必须填写变更原因，旧裁定保留为 `superseded` 并记录该原因；存在待确认裁定时不允许重复提交。
+- 导出校勘稿时每段显示当前采用文本与裁定状态，并汇总待确认数量和历史裁定条数。
 
 ## 主要接口
 
@@ -29,6 +32,7 @@ python -m unittest discover -s tests -v
 - `POST /api/variants`、`POST /api/variants/{id}/revisions`
 - `GET /api/passages/{id}/snapshots/{revision}?user_id=...`
 - `POST /api/passages/{id}/lock`
+- `POST /api/rulings`、`POST /api/rulings/{id}/confirm`
 - `GET /api/works/{id}/collation?user_id=...`
 
-导出接口把版本对齐、异文、注释、残损缺口和锁定状态组合成可复核的校勘稿。
+导出接口把版本对齐、异文、注释、残损缺口、锁定状态和裁定单组合成可复核的校勘稿。

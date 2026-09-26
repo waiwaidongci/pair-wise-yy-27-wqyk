@@ -138,6 +138,19 @@ class CollationDB:
               author_id INTEGER NOT NULL REFERENCES users(id),
               created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS rulings (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              passage_id INTEGER NOT NULL REFERENCES passages(id) ON DELETE CASCADE,
+              variant_id INTEGER NOT NULL REFERENCES variants(id),
+              adopted_text TEXT NOT NULL,
+              rationale TEXT NOT NULL,
+              status TEXT NOT NULL CHECK(status IN ('pending','confirmed','superseded')),
+              change_reason TEXT NOT NULL DEFAULT '',
+              created_by INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL,
+              confirmed_by INTEGER REFERENCES users(id),
+              confirmed_at TEXT
+            );
             CREATE TABLE IF NOT EXISTS passage_locks (
               passage_id INTEGER PRIMARY KEY REFERENCES passages(id) ON DELETE CASCADE,
               locked_by INTEGER NOT NULL REFERENCES users(id),
@@ -153,15 +166,18 @@ class CollationDB:
             return
         owner = self.add_user("项目负责人", "owner")
         editor = self.add_user("校勘编辑", "editor")
+        reviewer = self.add_user("审阅人", "reviewer")
         work = self.create_work("一则残卷", "演示不同版本的校勘", owner)
         w1 = self.add_witness(work, "甲本", "version", "馆藏胶片", "")
         w2 = self.add_witness(work, "乙本", "fragment", "残片转录", "第二句残损")
         self.grant_witness_editor(w2, editor, owner)
+        self.grant_work_access(work, reviewer, "review", owner)
         passage = self.add_passage(work, "第1节", "春水东流，故人南去。", owner)
         self.align_passage(passage, w1, "春水东流，故人南去。", 1, owner)
         self.align_passage(passage, w2, "春水东流，[不可辨][不可辨]。", 2, owner)
         variant = self.create_variant(passage, w2, "春水东流，故人南去。", "综合语义与行款补足", owner, 0)
         self.add_note(variant, "补字仍需参照纸背墨迹。", editor)
+        self.create_ruling(passage, variant, "甲本文意完整，乙本补字可从", reviewer)
 
     def add_user(self, name: str, role: str) -> int:
         if not name.strip() or role not in {"owner", "editor", "reviewer"}:
@@ -379,6 +395,65 @@ class CollationDB:
                 (passage_id, user_id, reason.strip(), datetime.now().isoformat()),
             )
 
+    def _can_review_work(self, work_id: int, user_id: int) -> bool:
+        if self.conn.execute("SELECT 1 FROM works WHERE id=? AND owner_id=?", (work_id, user_id)).fetchone():
+            return True
+        return bool(self.conn.execute(
+            "SELECT 1 FROM work_access WHERE work_id=? AND user_id=? AND permission='review'",
+            (work_id, user_id),
+        ).fetchone())
+
+    def create_ruling(self, passage_id: int, variant_id: int, rationale: str, user_id: int,
+                      change_reason: str = "") -> int:
+        passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
+        if not passage:
+            raise DomainError("段落不存在")
+        if not self._can_review_work(passage["work_id"], user_id):
+            raise DomainError("只有具备审阅权限的用户可以提交裁定")
+        variant = self.conn.execute("SELECT * FROM variants WHERE id=?", (variant_id,)).fetchone()
+        if not variant or variant["passage_id"] != passage_id:
+            raise DomainError("所选异文层不属于该段落")
+        if len(rationale.strip()) < 3:
+            raise DomainError("取舍说明至少3个字符")
+        active = self.conn.execute(
+            "SELECT * FROM rulings WHERE passage_id=? AND status IN ('pending','confirmed')", (passage_id,)
+        ).fetchone()
+        if active and active["status"] == "pending":
+            raise DomainError("已有待确认的裁定，需负责人先确认")
+        if active and len(change_reason.strip()) < 3:
+            raise DomainError("改判已定稿段落必须填写变更原因")
+        adopted = variant["proposed_text"]
+        needs_confirm = "[缺页]" in adopted or "[残损]" in adopted
+        now = datetime.now().isoformat()
+        with self.transaction():
+            if active:
+                self.conn.execute(
+                    "UPDATE rulings SET status='superseded',change_reason=? WHERE id=?",
+                    (change_reason.strip(), active["id"]),
+                )
+            cur = self.conn.execute(
+                "INSERT INTO rulings(passage_id,variant_id,adopted_text,rationale,status,created_by,created_at,confirmed_by,confirmed_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (passage_id, variant_id, adopted, rationale.strip(),
+                 "pending" if needs_confirm else "confirmed", user_id, now,
+                 None if needs_confirm else user_id, None if needs_confirm else now),
+            )
+        return int(cur.lastrowid)
+
+    def confirm_ruling(self, ruling_id: int, user_id: int) -> None:
+        ruling = self.conn.execute("SELECT * FROM rulings WHERE id=?", (ruling_id,)).fetchone()
+        if not ruling:
+            raise DomainError("裁定不存在")
+        passage = self.conn.execute("SELECT work_id FROM passages WHERE id=?", (ruling["passage_id"],)).fetchone()
+        self._require_owner(passage["work_id"], user_id)
+        if ruling["status"] != "pending":
+            raise DomainError("只有待确认的裁定可以确认")
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE rulings SET status='confirmed',confirmed_by=?,confirmed_at=? WHERE id=?",
+                (user_id, datetime.now().isoformat(), ruling_id),
+            )
+
     def get_snapshot(self, passage_id: int, revision_no: int, user_id: int) -> dict:
         passage = self.conn.execute("SELECT work_id FROM passages WHERE id=?", (passage_id,)).fetchone()
         if not passage or not self.can_view_work(passage["work_id"], user_id):
@@ -395,6 +470,8 @@ class CollationDB:
         witnesses = [dict(r) for r in self.conn.execute("SELECT * FROM witnesses WHERE work_id=? ORDER BY id", (work_id,))]
         passages = []
         gaps = 0
+        pending_rulings = 0
+        ruling_history = 0
         for passage in self.conn.execute("SELECT * FROM passages WHERE work_id=? ORDER BY id", (work_id,)).fetchall():
             alignments = []
             for row in self.conn.execute(
@@ -411,8 +488,23 @@ class CollationDB:
                 variant = dict(row)
                 variant["notes"] = [dict(r) for r in self.conn.execute("SELECT * FROM notes WHERE variant_id=? ORDER BY id", (row["id"],))]
                 variants.append(variant)
-            passages.append({**dict(passage), "alignments": alignments, "variants": variants})
-        return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps}
+            ruling = self.conn.execute(
+                "SELECT r.*,u.name AS created_by_name FROM rulings r JOIN users u ON u.id=r.created_by "
+                "WHERE r.passage_id=? AND r.status IN ('pending','confirmed') ORDER BY r.id DESC LIMIT 1",
+                (passage["id"],),
+            ).fetchone()
+            history = int(self.conn.execute("SELECT COUNT(*) FROM rulings WHERE passage_id=?", (passage["id"],)).fetchone()[0])
+            ruling_history += history
+            if ruling and ruling["status"] == "pending":
+                pending_rulings += 1
+            passages.append({
+                **dict(passage), "alignments": alignments, "variants": variants,
+                "adopted_text": ruling["adopted_text"] if ruling else None,
+                "ruling": dict(ruling) if ruling else None,
+                "ruling_history_count": history,
+            })
+        return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps,
+                "pending_ruling_count": pending_rulings, "ruling_history_count": ruling_history}
 
     def snapshot(self) -> dict:
         return {
@@ -420,4 +512,5 @@ class CollationDB:
             "works": [dict(r) for r in self.conn.execute("SELECT * FROM works ORDER BY id")],
             "witnesses": [dict(r) for r in self.conn.execute("SELECT * FROM witnesses ORDER BY id")],
             "passages": [dict(r) for r in self.conn.execute("SELECT * FROM passages ORDER BY id")],
+            "rulings": [dict(r) for r in self.conn.execute("SELECT * FROM rulings ORDER BY id")],
         }
